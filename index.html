@@ -7,7 +7,7 @@
     body { font-family: Arial, sans-serif; margin: 20px; }
     h2 { margin-top: 30px; }
     textarea { width: 100%; height: 300px; white-space: pre; font-family: monospace; }
-    button { padding: 10px 20px; margin-top: 10px; }
+    button { padding: 10px 20px; margin-top: 10px; margin-right: 10px; }
 
     ul { list-style: none; padding-left: 0; }
     li { background: #f0f0f0; padding: 6px 12px; margin: 5px 0; cursor: move; border: 1px solid #ccc; }
@@ -29,23 +29,29 @@
   <h2>2. 上传频道排序模板（标准 M3U 格式）</h2>
   <input type="file" id="templateFile" /><br />
 
-  <h2>3. 手动排序频道分组顺序（自动识别）</h2>
+  <h2>3. 手动排序频道分组顺序（可拖拽覆盖默认排序）</h2>
   <div class="sortable-box">
     <ul id="groupList"></ul>
   </div>
 
-  <button onclick="processFiles()">处理并导出</button>
+  <button onclick="previewFiles()">预览处理内容</button>
+  <button onclick="downloadPreview()">下载处理文件</button>
 
-  <h2>输出内容</h2>
+  <h2>输出内容预览</h2>
   <textarea id="outputArea" readonly></textarea>
 
   <script>
     const fileInput = document.getElementById('m3uFiles');
     const fileListEl = document.getElementById('fileList');
     const groupListEl = document.getElementById('groupList');
+    const outputArea = document.getElementById('outputArea');
 
-    let fileMap = []; // { file: File, name: string }
+    let fileMap = [];
     let detectedGroups = new Set();
+    let lastOutput = '';
+
+    // 默认分组顺序
+    const defaultGroupOrder = ["央视","卫视","地方","其他","香港","台湾","NBA","体育直播","体育频道","斯玛特","测试"];
 
     fileInput.addEventListener('change', () => {
       fileMap = Array.from(fileInput.files).map(f => ({ file: f, name: f.name }));
@@ -55,7 +61,7 @@
 
     function renderFileList() {
       fileListEl.innerHTML = '';
-      fileMap.forEach((f, i) => {
+      fileMap.forEach((f,i)=>{
         const li = document.createElement('li');
         li.textContent = f.name;
         li.draggable = true;
@@ -66,132 +72,147 @@
 
     function renderGroupList(groups) {
       groupListEl.innerHTML = '';
-      groups.forEach((group, i) => {
+      groups.forEach((g,i)=>{
         const li = document.createElement('li');
-        li.textContent = group;
+        li.textContent = g;
         li.draggable = true;
         li.dataset.index = i;
         groupListEl.appendChild(li);
       });
     }
 
-    function readGroupsFromFiles(fileArr) {
+    function readGroupsFromFiles(fileArr){
       detectedGroups = new Set();
-      const promises = fileArr.map(({ file }) =>
-        file.text().then(text => {
-          const lines = text.split('\n');
-          lines.forEach(line => {
-            if (line.startsWith('#EXTINF')) {
-              const match = line.match(/group-title="([^"]+)"/);
-              if (match) detectedGroups.add(match[1]);
-            }
-          });
-        })
-      );
+      const promises = fileArr.map(({file})=>file.text().then(text=>{
+        const lines = text.split('\n');
+        lines.forEach(line=>{
+          if(line.startsWith('#EXTINF')){
+            const match = line.match(/group-title="([^"]+)"/);
+            if(match) detectedGroups.add(match[1]);
+          }
+        });
+      }));
 
-      Promise.all(promises).then(() => {
-        renderGroupList(Array.from(detectedGroups));
+      Promise.all(promises).then(()=>{
+        // 使用默认顺序合并未识别的组
+        const allGroups = [...defaultGroupOrder];
+        detectedGroups.forEach(g=>{
+          if(!allGroups.includes(g)) allGroups.push(g);
+        });
+        renderGroupList(allGroups);
       });
     }
 
-    function fixTvgId(infoLine) {
+    function fixTvgId(infoLine){
       const hasTvgId = /tvg-id="[^"]*"/.test(infoLine);
       const tvgNameMatch = infoLine.match(/tvg-name="([^"]*)"/);
-
-      if (!hasTvgId && tvgNameMatch) {
+      if(!hasTvgId && tvgNameMatch){
         const tvgName = tvgNameMatch[1];
         const insertPos = infoLine.indexOf('tvg-name="');
-        if (insertPos !== -1) {
-          const insertStr = `tvg-id="${tvgName}" `;
-          return infoLine.slice(0, insertPos) + insertStr + infoLine.slice(insertPos);
-        }
+        const insertStr = `tvg-id="${tvgName}" `;
+        return infoLine.slice(0,insertPos)+insertStr+infoLine.slice(insertPos);
       }
       return infoLine;
     }
 
-    function parseM3U(content) {
+    function parseM3U(content){
       const lines = content.split('\n');
       const entries = [];
-
-      for (let i = 0; i < lines.length - 1; i++) {
+      for(let i=0;i<lines.length-1;i++){
         const line = lines[i].trim();
-        if (line.startsWith('#EXTINF')) {
+        if(line.startsWith('#EXTINF')){
           const infoLine = line;
-          const urlLine = lines[i + 1].trim();
+          const urlLine = lines[i+1].trim();
           const groupMatch = infoLine.match(/group-title="([^"]+)"/);
           const nameMatch = infoLine.match(/,(.+)$/);
           const group = groupMatch ? groupMatch[1] : '未分类';
           const name = nameMatch ? nameMatch[1].trim() : '未知频道';
-
           const fixedInfoLine = fixTvgId(infoLine);
-
-          entries.push({ group, name, info: fixedInfoLine, url: urlLine });
+          entries.push({group,name,info:fixedInfoLine,url:urlLine,originalIndex:i});
         }
       }
       return entries;
     }
 
-    async function processFiles() {
-      const fileOrder = Array.from(fileListEl.children).map(li => fileMap[parseInt(li.dataset.index)].file);
-      const groupOrder = Array.from(groupListEl.children).map(li => li.textContent);
+    async function previewFiles(){
+      lastOutput = await processFiles(false);
+      outputArea.value = lastOutput;
+    }
 
-      // 解析模板排序
+    async function downloadPreview(){
+      if(!lastOutput){
+        alert('请先点击“预览处理内容”生成文件。');
+        return;
+      }
+      downloadFile('merged_sorted.m3u',lastOutput);
+    }
+
+    async function processFiles(forDownload=true){
+      const fileOrder = Array.from(fileListEl.children).map(li=>fileMap[parseInt(li.dataset.index)].file);
+      const groupOrder = Array.from(groupListEl.children).map(li=>li.textContent);
+
+      // 模板解析
       let templateOrder = [];
+      let templateMap = {};
       const templateInput = document.getElementById('templateFile');
-      if (templateInput.files.length > 0) {
+      if(templateInput.files.length>0){
         const text = await templateInput.files[0].text();
         const templateEntries = parseM3U(text);
-        templateOrder = templateEntries.map(e => e.name);
+        templateOrder = templateEntries.map(e=>e.name);
+        templateEntries.forEach(e=>{
+          templateMap[e.name] = e.info; // 保存 #EXTINF 行
+        });
       }
 
-      // 合并所有 M3U 文件
+      // 合并文件
       let allEntries = [];
-      for (const file of fileOrder) {
+      for(const file of fileOrder){
         const text = await file.text();
         const entries = parseM3U(text);
         allEntries = allEntries.concat(entries);
       }
 
-      // 按 group 分类
+      // 按分组分类
       const grouped = {};
-      allEntries.forEach(entry => {
-        if (!grouped[entry.group]) grouped[entry.group] = [];
-        grouped[entry.group].push(entry);
+      allEntries.forEach(e=>{
+        if(!grouped[e.group]) grouped[e.group]=[];
+        grouped[e.group].push(e);
       });
 
-      // 构建输出
       let output = '#EXTM3U x-tvg-url="https://epg.443442.xyz/t.xml.gz"\n\n';
-      for (const group of groupOrder) {
-        if (!grouped[group]) continue;
-        let entries = grouped[group];
+      for(const group of groupOrder){
+        if(!grouped[group]) continue;
+        const entries = grouped[group];
 
-        // 如果有模板排序，则按模板频道顺序排
-        if (templateOrder.length > 0) {
-          entries.sort((a, b) => {
-            const aIndex = templateOrder.indexOf(a.name);
-            const bIndex = templateOrder.indexOf(b.name);
-            if (aIndex === -1 && bIndex === -1) return a.name.localeCompare(b.name);
-            if (aIndex === -1) return 1;
-            if (bIndex === -1) return -1;
-            return aIndex - bIndex;
-          });
-        } else {
-          entries.sort((a, b) => a.name.localeCompare(b.name));
-        }
+        // 模板排序已匹配的
+        const matched = [];
+        const unmatched = [];
+        entries.forEach(e=>{
+          if(templateOrder.includes(e.name)) matched.push(e);
+          else unmatched.push(e);
+        });
 
-        // 这里不再输出分组标题，用两个换行分割组
-        entries.forEach(e => {
-          output += `${e.info}\n${e.url}\n`;
+        matched.sort((a,b)=>{
+          const aIndex = templateOrder.indexOf(a.name);
+          const bIndex = templateOrder.indexOf(b.name);
+          return aIndex - bIndex;
+        });
+
+        const finalEntries = [...matched,...unmatched];
+
+        finalEntries.forEach(e=>{
+          const infoLine = templateMap[e.name] || e.info; // 仅替换 #EXTINF
+          output += `${infoLine}\n${e.url}\n`;
         });
         output += '\n\n';
       }
 
-      document.getElementById('outputArea').value = output;
-      downloadFile('merged_sorted.m3u', output);
+      if(forDownload) lastOutput = output;
+      return output;
     }
 
-    function downloadFile(filename, content) {
-      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    function downloadFile(filename,content){
+      const blob = new Blob([content],{type:'text/plain;charset=utf-8'});
       const link = document.createElement('a');
       const url = URL.createObjectURL(blob);
       link.href = url;
@@ -202,26 +223,25 @@
       URL.revokeObjectURL(url);
     }
 
-    // 拖拽排序逻辑
-    function enableDragSort(listElement) {
+    function enableDragSort(listElement){
       let draggingEl;
-      listElement.addEventListener('dragstart', e => draggingEl = e.target);
-      listElement.addEventListener('dragover', e => e.preventDefault());
-      listElement.addEventListener('drop', e => {
+      listElement.addEventListener('dragstart',e=>draggingEl=e.target);
+      listElement.addEventListener('dragover',e=>e.preventDefault());
+      listElement.addEventListener('drop',e=>{
         e.preventDefault();
-        if (!draggingEl || draggingEl === e.target || e.target.tagName !== 'LI') return;
+        if(!draggingEl || draggingEl===e.target || e.target.tagName!=='LI') return;
         const from = draggingEl.dataset.index;
         const to = e.target.dataset.index;
 
-        if (listElement === fileListEl) {
+        if(listElement===fileListEl){
           const temp = fileMap[from];
-          fileMap.splice(from, 1);
-          fileMap.splice(to, 0, temp);
+          fileMap.splice(from,1);
+          fileMap.splice(to,0,temp);
           renderFileList();
-        } else if (listElement === groupListEl) {
+        }else if(listElement===groupListEl){
           const arr = Array.from(detectedGroups);
-          const moved = arr.splice(from, 1)[0];
-          arr.splice(to, 0, moved);
+          const moved = arr.splice(from,1)[0];
+          arr.splice(to,0,moved);
           detectedGroups = new Set(arr);
           renderGroupList(arr);
         }
@@ -233,4 +253,3 @@
   </script>
 </body>
 </html>
-
